@@ -18,16 +18,13 @@ var (
 	ErrInvalidSessionID = errors.New("invalid session id")
 )
 
-// IDHandlerFunc Define the handler to get the session id
-type IDHandlerFunc func(context.Context) string
-
 // Define default options
 var defaultOptions = options{
 	cookieName:     "go_session_id",
 	cookieLifeTime: 3600 * 24 * 7,
 	expired:        7200,
 	secure:         true,
-	sessionID: func(_ context.Context) string {
+	sessionID: func() string {
 		return newUUID()
 	},
 	enableSetCookie:     true,
@@ -41,7 +38,7 @@ type options struct {
 	secure                  bool
 	domain                  string
 	expired                 int64
-	sessionID               IDHandlerFunc
+	sessionID               func() string
 	enableSetCookie         bool
 	enableSIDInURLQuery     bool
 	enableSIDInHTTPHeader   bool
@@ -95,9 +92,9 @@ func SetExpired(expired int64) Option {
 }
 
 // SetSessionID Set callback function to generate session id
-func SetSessionID(handler IDHandlerFunc) Option {
+func SetSessionID(sessionID func() string) Option {
 	return func(o *options) {
-		o.sessionID = handler
+		o.sessionID = sessionID
 	}
 }
 
@@ -202,23 +199,21 @@ func (m *Manager) decodeSessionID(value string) (string, error) {
 func (m *Manager) sessionID(r *http.Request) (string, error) {
 	var cookieValue string
 
-	if m.opts.enableSetCookie {
-		cookie, err := r.Cookie(m.opts.cookieName)
-		if err == nil && cookie.Value != "" {
-			cookieValue = cookie.Value
+	cookie, err := r.Cookie(m.opts.cookieName)
+	if err == nil && cookie.Value != "" {
+		cookieValue = cookie.Value
+	} else {
+		if m.opts.enableSIDInURLQuery {
+			err := r.ParseForm()
+			if err != nil {
+				return "", err
+			}
+			cookieValue = r.FormValue(m.opts.cookieName)
 		}
-	}
 
-	if m.opts.enableSIDInURLQuery && cookieValue == "" {
-		err := r.ParseForm()
-		if err != nil {
-			return "", err
+		if m.opts.enableSIDInHTTPHeader && cookieValue == "" {
+			cookieValue = r.Header.Get(m.opts.sessionNameInHTTPHeader)
 		}
-		cookieValue = r.FormValue(m.opts.cookieName)
-	}
-
-	if m.opts.enableSIDInHTTPHeader && cookieValue == "" {
-		cookieValue = r.Header.Get(m.opts.sessionNameInHTTPHeader)
 	}
 
 	if cookieValue != "" {
@@ -249,25 +244,25 @@ func (m *Manager) isSecure(r *http.Request) bool {
 
 func (m *Manager) setCookie(sessionID string, w http.ResponseWriter, r *http.Request) {
 	cookieValue := m.encodeSessionID(sessionID)
+	cookie := &http.Cookie{
+		Name:     m.opts.cookieName,
+		Value:    cookieValue,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   m.isSecure(r),
+		Domain:   m.opts.domain,
+	}
+
+	if v := m.opts.cookieLifeTime; v > 0 {
+		cookie.MaxAge = v
+		cookie.Expires = time.Now().Add(time.Duration(v) * time.Second)
+	}
 
 	if m.opts.enableSetCookie {
-		cookie := &http.Cookie{
-			Name:     m.opts.cookieName,
-			Value:    cookieValue,
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   m.isSecure(r),
-			Domain:   m.opts.domain,
-		}
-
-		if v := m.opts.cookieLifeTime; v > 0 {
-			cookie.MaxAge = v
-			cookie.Expires = time.Now().Add(time.Duration(v) * time.Second)
-		}
-
 		http.SetCookie(w, cookie)
-		r.AddCookie(cookie)
 	}
+
+	r.AddCookie(cookie)
 
 	if m.opts.enableSIDInHTTPHeader {
 		key := m.opts.sessionNameInHTTPHeader
@@ -284,17 +279,19 @@ func (m *Manager) Start(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		return nil, err
 	}
-
 	if sid != "" {
-		if exists, verr := m.opts.store.Check(ctx, sid); verr != nil {
+		exists, verr := m.opts.store.Check(ctx, sid)
+		if verr != nil {
 			return nil, verr
 		} else if exists {
 			return m.opts.store.Update(ctx, sid, m.opts.expired)
+		}else {
+			//return m.opts.store,nil
+			return m.opts.store.Create(ctx,sid, m.opts.expired)
 		}
 	}
 
-	sid = m.opts.sessionID(ctx)
-	store, err := m.opts.store.Create(ctx, sid, m.opts.expired)
+	store, err := m.opts.store.Create(ctx, m.opts.sessionID(), m.opts.expired)
 	if err != nil {
 		return nil, err
 	}
@@ -307,15 +304,14 @@ func (m *Manager) Start(ctx context.Context, w http.ResponseWriter, r *http.Requ
 func (m *Manager) Refresh(ctx context.Context, w http.ResponseWriter, r *http.Request) (Store, error) {
 	ctx = m.getContext(ctx, w, r)
 
-	oldsid, err := m.sessionID(r)
+	sid, err := m.sessionID(r)
 	if err != nil {
 		return nil, err
-	} else if oldsid == "" {
-		oldsid = m.opts.sessionID(ctx)
+	} else if sid == "" {
+		sid = m.opts.sessionID()
 	}
 
-	sid := m.opts.sessionID(ctx)
-	store, err := m.opts.store.Refresh(ctx, oldsid, sid, m.opts.expired)
+	store, err := m.opts.store.Refresh(ctx, sid, m.opts.sessionID(), m.opts.expired)
 	if err != nil {
 		return nil, err
 	}
@@ -347,6 +343,12 @@ func (m *Manager) Destroy(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return err
 	}
 
+	if m.opts.enableSIDInHTTPHeader {
+		key := m.opts.sessionNameInHTTPHeader
+		r.Header.Del(key)
+		w.Header().Del(key)
+	}
+
 	if m.opts.enableSetCookie {
 		cookie := &http.Cookie{
 			Name:     m.opts.cookieName,
@@ -357,12 +359,6 @@ func (m *Manager) Destroy(ctx context.Context, w http.ResponseWriter, r *http.Re
 		}
 
 		http.SetCookie(w, cookie)
-	}
-
-	if m.opts.enableSIDInHTTPHeader {
-		key := m.opts.sessionNameInHTTPHeader
-		r.Header.Del(key)
-		w.Header().Del(key)
 	}
 
 	return nil
